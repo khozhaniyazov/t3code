@@ -4439,3 +4439,54 @@ describe("Windows long path configuration", () => {
     }
   });
 });
+
+describe("createWorktree failure detail", () => {
+  it.effect("reports an actionable detail when the path is already registered", () =>
+    Effect.gen(function* () {
+      const driver = yield* GitVcsDriver.GitVcsDriver;
+      const repository = yield* makeTmpDir();
+      yield* initRepoWithCommit(repository);
+      const first = yield* makeTmpDir();
+      yield* git(repository, ["worktree", "add", "--detach", first]);
+      // Second add at an occupied location must classify to a worktree reason
+      // and surface a credential-safe actionable detail, not a bare fallback.
+      const result = yield* driver
+        .createWorktree({ cwd: repository, refName: "HEAD", path: first })
+        .pipe(Effect.result);
+      assert.isTrue(Result.isFailure(result));
+      if (Result.isFailure(result)) {
+        const failure = result.failure;
+        assert.instanceOf(failure, GitCommandError);
+        assert.isDefined(failure.reason);
+        assert.include(failure.detail, "git worktree add failed");
+        assert.notInclude(failure.detail, "exited with a non-zero status");
+      }
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("reports an actionable detail when the base ref is unknown", () =>
+    Effect.gen(function* () {
+      const driver = yield* GitVcsDriver.GitVcsDriver;
+      const pathService = yield* Path.Path;
+      const repository = yield* makeTmpDir();
+      yield* initRepoWithCommit(repository);
+      const scratch = yield* makeTmpDir();
+      // createWorktree needs a *vacant* path; derive one inside the scratch dir.
+      const path = pathService.join(scratch, "new-worktree");
+      const result = yield* driver
+        .createWorktree({
+          cwd: repository,
+          refName: "definitely-not-a-real-ref-xyz",
+          path,
+        })
+        .pipe(Effect.result);
+      assert.isTrue(Result.isFailure(result));
+      if (Result.isFailure(result)) {
+        const failure = result.failure;
+        assert.instanceOf(failure, GitCommandError);
+        assert.strictEqual(failure.reason, "worktree_ref_invalid");
+        assert.include(failure.detail, "base ref is unknown");
+      }
+    }).pipe(Effect.provide(layerTest)),
+  );
+});

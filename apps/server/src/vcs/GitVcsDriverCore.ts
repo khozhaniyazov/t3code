@@ -170,6 +170,12 @@ interface ExecuteGitOptions {
   timeoutMs?: number | null | undefined;
   allowNonZeroExit?: boolean | undefined;
   fallbackErrorDetail?: string | undefined;
+  /**
+   * Optional reason-tag → detail overrides. When the failure classifies to a
+   * tag present here, its detail replaces the fallback (still never quoting
+   * stderr). Lets call sites explain their own failure modes.
+   */
+  mapErrorDetail?: Readonly<Record<string, string>> | undefined;
   env?: NodeJS.ProcessEnv | undefined;
   maxOutputBytes?: number | undefined;
   appendTruncationMarker?: boolean | undefined;
@@ -471,6 +477,14 @@ const GIT_FAILURE_REASON_PATTERNS: ReadonlyArray<readonly [RegExp, GitCommandFai
   // Quoted-path forms only: an unquoted `fatal: <thing> already exists` also
   // covers tag and ref collisions, which are not path collisions.
   [/fatal: '[^']+' already exists|destination path .+ already exists/i, "path_already_exists"],
+  // Worktree provisioning failures (createWorktree): without these, the only
+  // surfaced text was the fallback "git worktree add failed".
+  [/is already registered under '[^']+'|already used by worktree at/i, "worktree_path_in_use"],
+  [/invalid reference|unknown revision|did not match any file/i, "worktree_ref_invalid"],
+  [
+    /would be overwritten by checkout|unable to checkout|checkout conflict/i,
+    "worktree_checkout_conflict",
+  ],
 ];
 
 // Hooks write to the same stream git does, and nothing distinguishes their text
@@ -486,6 +500,26 @@ const GIT_DIAGNOSTIC_LINE_PATTERN = /^(?:fatal|error):|^!\s|^\s+!\s/;
 // cause is credentials, so these specific refusals are classified too.
 const SSH_TRANSPORT_REFUSAL_PATTERN =
   /Permission denied \((?:publickey|password|keyboard-interactive)|Permission denied, please try again|Host key verification failed/i;
+
+/**
+ * Credential-safe human detail for classified worktree failures. Keyed only by
+ * the reason tag — never quotes stderr, which can echo argv and remote URLs.
+ */
+const WORKTREE_ADD_REASON_DETAILS: Readonly<Record<string, string>> = {
+  worktree_path_in_use:
+    "git worktree add failed: the target path is already registered to another worktree. " +
+    "Prune stale worktrees with `git worktree prune` and retry.",
+  worktree_ref_invalid:
+    "git worktree add failed: the base ref is unknown in this clone. " +
+    "Fetch the remote (`git fetch`) so the ref exists, then retry.",
+  worktree_checkout_conflict:
+    "git worktree add failed: checkout would overwrite files at the target path. " +
+    "Clear the target directory and retry.",
+  branch_checked_out_in_worktree:
+    "git worktree add failed: the branch is already checked out in another worktree.",
+  branch_already_exists: "git worktree add failed: the new branch name already exists.",
+  path_already_exists: "git worktree add failed: the target path already exists and is not empty.",
+};
 
 function classifyGitFailure(stderr: string): GitCommandFailureReason | null {
   const diagnostics = stderr
@@ -1119,11 +1153,15 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           return Effect.succeed(result);
         }
         const reason = classifyGitFailure(result.stderr);
+        const mappedDetail = reason !== null ? options.mapErrorDetail?.[reason] : undefined;
         return Effect.fail(
           new GitCommandError({
             ...gitCommandContext({ operation, cwd, args }),
             ...(reason === null ? {} : { reason }),
-            detail: options.fallbackErrorDetail ?? "Git command exited with a non-zero status.",
+            detail:
+              mappedDetail ??
+              options.fallbackErrorDetail ??
+              "Git command exited with a non-zero status.",
             ...(result.exitCode === null ? {} : { exitCode: result.exitCode }),
             stdoutLength: result.stdout.length,
             stderrLength: result.stderr.length,
@@ -3459,6 +3497,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       input.cwd,
       ["-c", `checkout.workers=${checkoutWorkers}`, ...args],
       {
+        mapErrorDetail: WORKTREE_ADD_REASON_DETAILS,
         fallbackErrorDetail: "git worktree add failed",
         timeoutMs: WORKTREE_ADD_TIMEOUT_MS,
         ...(onCheckoutProgress
