@@ -170,4 +170,30 @@ describe("orchestrator MCP contracts", () => {
       }).reason,
     ).toBe("Loop converged.");
   });
+
+  it("accepts string-encoded timeoutMs from model routers", () => {
+    // Routers (Codex app-server, OpenCode) serialize numerics as strings.
+    expect(
+      decodeDelegateTaskInput({ task: "t", mode: "wait", timeoutMs: "600000" }).timeoutMs,
+    ).toBe(600_000);
+    expect(
+      decodeDelegateTaskInput({ task: "t", mode: "wait", timeoutMs: "600000.0" }).timeoutMs,
+    ).toBe(600_000);
+    expect(decodeThreadWaitInput({ threadId: "thread-1", timeoutMs: "600000" }).timeoutMs).toBe(
+      600_000,
+    );
+    expect(decodeDelegateTaskInput({ task: "t", mode: "wait" }).timeoutMs).toBeUndefined();
+    expect(() => decodeDelegateTaskInput({ task: "t", mode: "wait", timeoutMs: "soon" })).toThrow();
+    expect(() => decodeDelegateTaskInput({ task: "t", mode: "wait", timeoutMs: "" })).toThrow();
+  });
+
+  it("clamps over-large thread-read page sizes instead of failing", () => {
+    expect(decodeThreadReadInput({ threadId: "thread-1", limit: 200 }).limit).toBe(100);
+    expect(decodeThreadReadInput({ threadId: "thread-1", limit: 150 }).limit).toBe(100);
+    expect(decodeThreadReadInput({ threadId: "thread-1", limit: "200" }).limit).toBe(100);
+    expect(decodeThreadReadInput({ threadId: "thread-1", runLimit: 99 }).runLimit).toBe(50);
+    expect(decodeThreadReadInput({ threadId: "thread-1", limit: 25 }).limit).toBe(25);
+    expect(() => decodeThreadReadInput({ threadId: "thread-1", limit: 0 })).toThrow();
+    expect(() => decodeThreadReadInput({ threadId: "thread-1", limit: -5 })).toThrow();
+  });
 });

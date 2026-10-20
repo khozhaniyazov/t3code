@@ -356,6 +356,9 @@ export const GitCommandFailureReason = Schema.Literals([
   "path_already_exists",
   "remote_unreachable",
   "tag_would_be_clobbered",
+  "worktree_path_in_use",
+  "worktree_ref_invalid",
+  "worktree_checkout_conflict",
 ]);
 export type GitCommandFailureReason = typeof GitCommandFailureReason.Type;
 

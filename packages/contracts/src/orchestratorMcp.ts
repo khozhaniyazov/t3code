@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as SchemaIssue from "effect/SchemaIssue";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import {
@@ -44,6 +45,73 @@ const OrchestratorMcpPrompt = TrimmedNonEmptyString.check(Schema.isMaxLength(120
 const OrchestratorMcpTitle = TrimmedNonEmptyString.check(Schema.isMaxLength(512)).annotate({
   description: "Optional concise display title.",
 });
+/**
+ * Model routers (Codex app-server, OpenCode) routinely serialize numeric MCP
+ * params as strings (e.g. "600000", "600000.0"). Accept both at the tool
+ * boundary and decode to a finite number immediately, so agents get results
+ * instead of -32602 errors for a cosmetic type difference.
+ */
+const LenientNumber = Schema.Union([Schema.Number, Schema.String])
+  .pipe(
+    Schema.decodeTo(
+      Schema.Number,
+      SchemaTransformation.transformEffect({
+        decode: (input, options) => {
+          const invalid = (message: string) =>
+            Effect.fail(new SchemaIssue.InvalidValue({ message }, input, options));
+          if (typeof input === "number") {
+            return Number.isFinite(input)
+              ? Effect.succeed(input)
+              : invalid(`Expected a finite number, got ${input}`);
+          }
+          const trimmed = input.trim();
+          if (trimmed.length === 0) {
+            return invalid("Expected a number, got an empty string");
+          }
+          const parsed = Number(trimmed);
+          return Number.isFinite(parsed)
+            ? Effect.succeed(parsed)
+            : invalid(`Expected a number, got ${JSON.stringify(input)}`);
+        },
+        encode: (output) => Effect.succeed(output),
+      }),
+    ),
+  )
+  .annotate({
+    description:
+      'A finite number. Numeric strings (e.g. "600000") are accepted for router compatibility.',
+  });
+
+/**
+ * Page-size params: clamp over-large values to the documented max instead of
+ * failing the call. Agents routinely ask for 150-200 items; returning 100
+ * with normal pagination is strictly more useful than a -32602 error.
+ */
+const clampPositiveInt = (maximum: number) =>
+  Schema.Unknown.pipe(
+    Schema.decodeTo(
+      PositiveInt.check(Schema.isLessThanOrEqualTo(maximum)),
+      SchemaTransformation.transformEffect({
+        decode: (input, options) =>
+          Effect.suspend(() => {
+            const raw =
+              typeof input === "string" && input.trim().length > 0 ? Number(input.trim()) : input;
+            if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) {
+              return Effect.fail(
+                new SchemaIssue.InvalidValue(
+                  { message: "Expected a positive integer page size" },
+                  input,
+                  options,
+                ),
+              );
+            }
+            return Effect.succeed(Math.min(raw, maximum));
+          }),
+        encode: (output) => Effect.succeed(output),
+      }),
+    ),
+  );
+
 const OrchestratorMcpClientRequestId = TrimmedNonEmptyString.check(
   Schema.isMaxLength(256),
 ).annotate({ description: "Stable idempotency key to reuse when retrying this mutation." });
@@ -173,9 +241,9 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
         "Defaults to async. Use wait only when this turn needs the child's result before you can continue.",
     }),
   ),
-  timeoutMs: Schema.optional(Schema.Number).annotate({
+  timeoutMs: Schema.optional(LenientNumber).annotate({
     description:
-      "Wait budget for mode=wait only. Default 10 minutes. Elapsing it returns waitTimedOut=true on that call and does not cancel the child.",
+      "Wait budget for mode=wait only. Default 10 minutes. Elapsing it returns waitTimedOut=true on that call and does not cancel the child. Pass a JSON number (600000), or omit for the default.",
   }),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
   runtimeMode: Schema.optional(
@@ -343,9 +411,14 @@ export const OrchestratorMcpThreadReadInput = Schema.Struct({
   textOffset: Schema.optional(NonNegativeInt),
   view: Schema.optional(Schema.Literals(["messages", "activity"])),
   afterPosition: Schema.optional(NonNegativeInt),
-  limit: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(100))),
-  runLimit: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(50))),
-  maxCharsPerItem: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(50_000))),
+  limit: Schema.optional(clampPositiveInt(100)).annotate({
+    description:
+      "Max 100 items per page; larger values are clamped to 100. Page with afterPosition.",
+  }),
+  runLimit: Schema.optional(clampPositiveInt(50)).annotate({
+    description: "Max 50 runs; larger values are clamped to 50.",
+  }),
+  maxCharsPerItem: Schema.optional(clampPositiveInt(50_000)),
 });
 export type OrchestratorMcpThreadReadInput = typeof OrchestratorMcpThreadReadInput.Type;
 
@@ -443,7 +516,9 @@ export type OrchestratorMcpThreadSendResult = typeof OrchestratorMcpThreadSendRe
 export const OrchestratorMcpThreadWaitInput = Schema.Struct({
   threadId: ThreadId,
   runId: Schema.optional(RunId),
-  timeoutMs: Schema.optional(Schema.Number),
+  timeoutMs: Schema.optional(LenientNumber).annotate({
+    description: "Wait budget as a JSON number of milliseconds (600000), or omit for the default.",
+  }),
 });
 export type OrchestratorMcpThreadWaitInput = typeof OrchestratorMcpThreadWaitInput.Type;
 
@@ -595,8 +670,13 @@ export const OrchestratorMcpRequestSecretInput = Schema.Struct({
     description: "Hint inside the input, e.g. 'Paste your GitHub token'.",
   }),
   timeoutMs: Schema.optional(
-    Schema.Int.check(Schema.isBetween({ minimum: 1_000, maximum: 60 * 60 * 1_000 })),
-  ).annotate({ description: "How long to wait for the user. Default 10 minutes." }),
+    LenientNumber.check(Schema.isInt()).check(
+      Schema.isBetween({ minimum: 1_000, maximum: 60 * 60 * 1_000 }),
+    ),
+  ).annotate({
+    description:
+      "How long to wait for the user, as a JSON number of milliseconds. Default 10 minutes.",
+  }),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId).annotate({
     description:
       "Reuse when retrying a call that lost its result, so the user sees one card and its answer is returned again. Use a new id to ask again after timed_out or cancelled.",
